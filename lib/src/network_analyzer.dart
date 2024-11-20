@@ -22,92 +22,6 @@ class NetworkAddress {
 
 /// Pings a given subnet (xxx.xxx.xxx) on a given port using [discover] method.
 class NetworkAnalyzer {
-  /// Pings a given [subnet] (xxx.xxx.xxx) on a given [port].
-  ///
-  /// Pings IP:PORT one by one
-  static Stream<NetworkAddress> discover(
-    String subnet,
-    int port, {
-    Duration timeout = const Duration(milliseconds: 400),
-  }) async* {
-    if (port < 1 || port > 65535) {
-      throw 'Incorrect port';
-    }
-    // TODO : validate subnet
-
-    for (int i = 1; i < 256; ++i) {
-      final host = '$subnet.$i';
-
-      try {
-        final Socket s = await Socket.connect(host, port, timeout: timeout);
-        s.destroy();
-        yield NetworkAddress(host, true);
-      } catch (e) {
-        if (!(e is SocketException)) {
-          rethrow;
-        }
-
-        // Check if connection timed out or we got one of predefined errors
-        if (e.osError == null || _errorCodes.contains(e.osError!.errorCode)) {
-          yield NetworkAddress(host, false);
-        } else {
-          // Error 23,24: Too many open files in system
-          rethrow;
-        }
-      }
-    }
-  }
-
-  /// Pings a given [subnet] (xxx.xxx.xxx) on a given [port].
-  ///
-  /// Pings IP:PORT all at once
-  static Stream<NetworkAddress> discover2(
-    String subnet,
-    int port, {
-    Duration timeout = const Duration(seconds: 5),
-  }) {
-    if (port < 1 || port > 65535) {
-      throw 'Incorrect port';
-    }
-    // TODO : validate subnet
-
-    final out = StreamController<NetworkAddress>();
-    final futures = <Future<Socket>>[];
-    for (int i = 1; i < 256; ++i) {
-      final host = '$subnet.$i';
-      final Future<Socket> f = _ping(host, port, timeout);
-      futures.add(f);
-      f.then((socket) {
-        socket.destroy();
-        out.sink.add(NetworkAddress(host, true));
-      }).catchError((dynamic e) {
-        if (!(e is SocketException)) {
-          throw e;
-        }
-
-        // Check if connection timed out or we got one of predefined errors
-        if (e.osError == null || _errorCodes.contains(e.osError!.errorCode)) {
-          out.sink.add(NetworkAddress(host, false));
-        } else {
-          // Error 23,24: Too many open files in system
-          throw e;
-        }
-      });
-    }
-
-    Future.wait<Socket>(futures)
-        .then<void>((sockets) => out.close())
-        .catchError((dynamic e) => out.close());
-
-    return out.stream;
-  }
-
-  static Future<Socket> _ping(String host, int port, Duration timeout) {
-    return Socket.connect(host, port, timeout: timeout).then((socket) {
-      return socket;
-    });
-  }
-
   // 13: Connection failed (OS Error: Permission denied)
   // 49: Bind failed (OS Error: Can't assign requested address)
   // 51: Network is unreachable
@@ -119,5 +33,157 @@ class NetworkAnalyzer {
   // 111: Connection refused
   // 113: No route to host
   // <empty>: SocketException: Connection timed out
-  static final _errorCodes = [13, 49, 51, 61, 64, 65, 101, 110, 111, 113];
+  // 104: Connection reset by peer
+  static final _errorCodes = [13, 49, 61, 64, 65, 101, 104, 111, 113];
+
+  /// Validates subnet format
+  static bool _isValidSubnet(String subnet) {
+    final parts = subnet.split('.');
+    if (parts.length != 3) return false;
+
+    for (final part in parts) {
+      final number = int.tryParse(part);
+      if (number == null || number < 0 || number > 255) return false;
+    }
+
+    return true;
+  }
+
+  /// Improved ping function with better error handling
+  static Future<Socket> _ping(String host, int port, Duration timeout) async {
+    try {
+      final socket = await Socket.connect(host, port, timeout: timeout);
+      return socket;
+    } on SocketException catch (e) {
+      if (e.osError != null && !_errorCodes.contains(e.osError!.errorCode)) {
+        print('Network scan error for $host: ${e.message} (Error ${e.osError!.errorCode})');
+      }
+      rethrow;
+    } catch (e) {
+      print('Unexpected error while scanning $host: $e');
+      rethrow;
+    }
+  }
+
+  /// Sequential discovery (safer but slower)
+  static Stream<NetworkAddress> discover(
+    String subnet,
+    int port, {
+    Duration timeout = const Duration(milliseconds: 400),
+  }) async* {
+    // Validate inputs
+    if (port < 1 || port > 65535) {
+      throw ArgumentError('Port must be between 1 and 65535');
+    }
+
+    if (!_isValidSubnet(subnet)) {
+      throw ArgumentError('Invalid subnet format. Expected format: xxx.xxx.xxx');
+    }
+
+    for (int i = 1; i < 256; ++i) {
+      final host = '$subnet.$i';
+      try {
+        final Socket s = await Socket.connect(host, port, timeout: timeout).timeout(timeout, onTimeout: () {
+          throw SocketException('Connection timeout');
+        });
+        await s.close(); // Properly close the socket
+        yield NetworkAddress(host, true);
+      } on SocketException catch (e) {
+        if (e.osError == null || _errorCodes.contains(e.osError!.errorCode)) {
+          yield NetworkAddress(host, false);
+        } else {
+          print('Network error scanning $host: ${e.message}');
+          yield NetworkAddress(host, false);
+        }
+      } catch (e) {
+        print('Error scanning $host: $e');
+        yield NetworkAddress(host, false);
+      }
+    }
+  }
+
+  /// Parallel discovery (faster but more resource-intensive)
+  static Stream<NetworkAddress> discover2(
+    String subnet,
+    int port, {
+    Duration timeout = const Duration(seconds: 5),
+  }) {
+    // Validate inputs
+    if (port < 1 || port > 65535) {
+      throw ArgumentError('Port must be between 1 and 65535');
+    }
+
+    if (!_isValidSubnet(subnet)) {
+      throw ArgumentError('Invalid subnet format. Expected format: xxx.xxx.xxx');
+    }
+
+    final out = StreamController<NetworkAddress>();
+    final futures = <Future<Socket>>[];
+    var activeScans = 0;
+    const maxConcurrentScans = 50; // Limit concurrent connections
+
+    void startScan(String host) {
+      activeScans++;
+      final Future<Socket> f = _ping(host, port, timeout);
+      futures.add(f);
+
+      f.then((socket) async {
+        try {
+          await socket.close(); // Properly close the socket
+          out.sink.add(NetworkAddress(host, true));
+        } catch (e) {
+          print('Error closing socket for $host: $e');
+        } finally {
+          activeScans--;
+        }
+      }).catchError((dynamic e) {
+        activeScans--;
+        if (e is SocketException) {
+          if (e.osError == null || _errorCodes.contains(e.osError!.errorCode)) {
+            out.sink.add(NetworkAddress(host, false));
+          } else {
+            print('Socket error scanning $host: ${e.message}');
+            out.sink.add(NetworkAddress(host, false));
+          }
+        } else {
+          print('Unexpected error scanning $host: $e');
+          out.sink.add(NetworkAddress(host, false));
+        }
+      });
+    }
+
+    // Scan in batches to prevent overwhelming the system
+    int i = 1;
+    Timer? timer;
+
+    void scheduleNextScan() {
+      if (i >= 256) {
+        timer?.cancel();
+        return;
+      }
+
+      if (activeScans < maxConcurrentScans) {
+        final host = '$subnet.$i';
+        startScan(host);
+        i++;
+      }
+    }
+
+    timer = Timer.periodic(Duration(milliseconds: 50), (_) {
+      scheduleNextScan();
+    });
+
+    // Close stream when all scans are complete
+    Future.wait<Socket>(futures).then<void>((sockets) async {
+      timer?.cancel();
+      await Future.delayed(Duration(milliseconds: 100)); // Small delay to ensure all callbacks complete
+      await out.close();
+    }).catchError((dynamic e) async {
+      timer?.cancel();
+      print('Error during network scan: $e');
+      await out.close();
+    });
+
+    return out.stream;
+  }
 }
