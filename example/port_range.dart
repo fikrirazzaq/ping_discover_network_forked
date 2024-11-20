@@ -12,7 +12,11 @@ void checkPortRange(String subnet, int fromPort, int toPort) {
   }
 
   print('port $fromPort');
-  final stream = NetworkAnalyzer.discover(subnet, fromPort);
+  final stream = NetworkScanner(
+    subnet: subnet,
+    port: fromPort,
+    timeout: Duration(milliseconds: 5000),
+  ).discover();
 
   stream.listen((NetworkAddress addr) {
     if (addr.exists) {

@@ -12,11 +12,11 @@ void main() async {
   // NetworkAnalyzer.discover2 pings all PORT:IP addresses at once.
 
   const port = 80;
-  final stream = NetworkAnalyzer.discover2(
-    '192.168.0',
-    port,
+  final stream = NetworkScanner(
+    subnet: '192.168.0',
+    port: port,
     timeout: Duration(milliseconds: 5000),
-  );
+  ).discover();
 
   int found = 0;
   stream.listen((NetworkAddress addr) {

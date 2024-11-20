@@ -60,7 +60,7 @@ class _MyHomePageState extends State<MyHomePage> {
     }
     print('subnet:\t$subnet, port:\t$port');
 
-    final stream = NetworkAnalyzer.discover(subnet, port);
+    final stream = NetworkScanner(subnet: subnet, port: port).discover();
 
     stream.listen((NetworkAddress addr) {
       if (addr.exists) {
